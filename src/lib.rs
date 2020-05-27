@@ -1,3 +1,4 @@
+#![feature(async_closure)]
 //! redis-rs is a rust implementation of a Redis client library.  It exposes
 //! a general purpose interface to Redis and also provides specific helpers for
 //! commonly used functionality.
@@ -386,6 +387,9 @@ mod macros;
 #[cfg(feature = "aio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aio")))]
 pub mod aio;
+
+#[cfg(feature = "aio")]
+pub mod tokio_cluster;
 
 /// Enables the async_std compatibility
 #[cfg(feature = "async-std-comp")]
