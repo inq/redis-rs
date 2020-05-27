@@ -75,7 +75,7 @@ futures = "0.3"
 criterion = "0.3"
 partial-io = { version = "0.3", features = ["tokio", "quickcheck"] }
 quickcheck = "0.6"
-tokio = { version = "0.2", features = ["rt-core", "macros", "time"] }
+tokio = { version = "0.2", features = ["rt-core", "rt-util", "macros", "time"] }
 
 [[test]]
 name = "test_async"

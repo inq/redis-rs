@@ -139,13 +139,13 @@ impl ClusterClient {
 
     /// Returns an async connection from the client.
     #[cfg(feature = "aio")]
-    pub async fn get_async_connection(&self) -> RedisResult<crate::tokio_cluster::ClusterConnection> {
+    pub async fn get_async_connection(&self) -> RedisResult<crate::tokio_cluster::Conn> {
         self.get_tokio_connection_tokio().await
     }
 
     /// Returns an async connection from the client.
-    pub async fn get_tokio_connection_tokio(&self) -> RedisResult<crate::tokio_cluster::ClusterConnection> {
-        crate::tokio_cluster::ClusterConnection::new(
+    pub async fn get_tokio_connection_tokio(&self) -> RedisResult<crate::tokio_cluster::Conn> {
+        crate::tokio_cluster::Conn::new(
             self.initial_nodes.clone(),
             self.readonly,
             self.password.clone(),

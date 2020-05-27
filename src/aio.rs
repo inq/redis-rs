@@ -935,7 +935,7 @@ mod connection_manager {
                 MultiplexedConnection::create_connection(&connection_info, con).await?;
 
             // Spawn the driver that drives the connection future
-            tokio::spawn(driver);
+            tokio::task::spawn_local(driver);
 
             // Wrap the connection in an `ArcSwap` instance for fast atomic access
             Ok(Self {
@@ -975,7 +975,7 @@ mod connection_manager {
                 let (new_connection, driver) =
                     MultiplexedConnection::create_connection(&connection_info, con).await?;
 
-                tokio::spawn(driver);
+                tokio::task::spawn_local(driver);
                 Ok(new_connection)
             }
             .boxed()
@@ -990,7 +990,7 @@ mod connection_manager {
             // If the swap happened...
             if Arc::ptr_eq(&prev, &current) {
                 // ...start the connection attempt immediately but do not wait on it.
-                tokio::spawn(new_connection);
+                tokio::task::spawn_local(new_connection);
             }
         }
     }

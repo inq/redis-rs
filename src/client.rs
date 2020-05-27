@@ -135,7 +135,7 @@ impl Client {
         &self,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         let (connection, driver) = self.create_multiplexed_tokio_connection().await?;
-        tokio::spawn(driver);
+        tokio::task::spawn_local(driver);
         Ok(connection)
     }
 

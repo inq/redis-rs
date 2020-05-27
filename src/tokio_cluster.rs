@@ -38,6 +38,8 @@
 //!     .expire(key, 60).ignore()
 //!     .query(&mut connection).unwrap();
 //! ```
+use tokio::sync::Mutex;
+use std::sync::Arc;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter::Iterator;
@@ -58,6 +60,24 @@ use super::aio::{Connection, ConnectionLike};
 const SLOT_SIZE: usize = 16384;
 
 type SlotMap = BTreeMap<u16, String>;
+
+#[derive(Clone)]
+pub struct Conn {
+    inner: Arc<Mutex<ClusterConnection>>,
+}
+
+impl Conn {
+    pub async fn new(
+        initial_nodes: Vec<ConnectionInfo>,
+        readonly: bool,
+        password: Option<String>,
+    ) -> RedisResult<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(ClusterConnection::new(initial_nodes, readonly, password).await?)),
+        })
+    }
+}
+
 
 /// This is a connection of Redis cluster.
 pub struct ClusterConnection {
@@ -311,6 +331,19 @@ impl ClusterConnection {
         Ok(Value::merge_results(results))
     }
 
+    async fn execute_packed_commands_on_all_nodes(&self, cmd: &cmd::Pipeline, offset: usize, count: usize) -> RedisResult<Vec<Value>>
+    {
+        let mut connections = self.connections.borrow_mut();
+        let mut results = HashMap::new();
+
+        // TODO: reconnect and shit
+        for (addr, connection) in connections.iter_mut() {
+            results.insert(addr.as_str(), connection.req_packed_commands(cmd, offset, count).await?);
+        }
+
+        Ok(MergeResults::merge_results(results))
+    }
+
     #[allow(clippy::unnecessary_unwrap)]
     async fn request<T, F>(&self, cmd: &[u8], mut func: F) -> RedisResult<T>
     where
@@ -507,6 +540,105 @@ impl ClusterConnection {
             }
         }
     }
+
+    // TODO: Remove this quick & dirty solution
+    #[allow(clippy::unnecessary_unwrap)]
+    async fn request_packed_commands(&self, cmd: &cmd::Pipeline, offset: usize, count: usize) -> RedisResult<Vec<Value>>
+    {
+        let packed = cmd.get_packed_pipeline();
+        let slot = match RoutingInfo::for_packed_command(&packed) {
+            Some(RoutingInfo::Random) => None,
+            Some(RoutingInfo::Slot(slot)) => Some(slot),
+            Some(RoutingInfo::AllNodes) | Some(RoutingInfo::AllMasters) => {
+                return self.execute_packed_commands_on_all_nodes(cmd, offset, count).await;
+            }
+            None => {
+                return Err((
+                    ErrorKind::ClientError,
+                    "this command cannot be safely routed in cluster mode",
+                )
+                    .into())
+            }
+        };
+
+        let mut retries = 16;
+        let mut excludes = HashSet::new();
+        let mut asking = None::<String>;
+        loop {
+            // Get target address and response.
+            let (addr, rv) = {
+                let mut connections = self.connections.borrow_mut();
+                let (addr, conn) = if let Some(addr) = asking.take() {
+                    let conn = self.get_connection_by_addr(&mut *connections, &addr).await?;
+                    // if we are in asking mode we want to feed a single
+                    // ASKING command into the connection before what we
+                    // actually want to execute.
+                    let mut cmd = Cmd::new();
+                    cmd.arg("ASKING");
+                    // conn.req_packed_command(&b"*1\r\n$6\r\nASKING\r\n"[..]).await?;
+                    conn.req_packed_command(&cmd).await?;
+                    (addr.to_string(), conn)
+                } else if !excludes.is_empty() || slot.is_none() {
+                    get_random_connection(&mut *connections, Some(&excludes))
+                } else {
+                    self.get_connection(&mut *connections, slot.unwrap()).await?
+                };
+                (addr, conn.req_packed_commands(cmd, offset, count).await)
+            };
+
+            match rv {
+                Ok(rv) => return Ok(rv),
+                Err(err) => {
+                    retries -= 1;
+                    if retries == 0 {
+                        return Err(err);
+                    }
+
+                    if err.is_cluster_error() {
+                        let kind = err.kind();
+
+                        if kind == ErrorKind::Ask {
+                            asking = err.redirect_node().map(|x| x.0.to_string());
+                        } else if kind == ErrorKind::Moved {
+                            // Refresh slots and request again.
+                            self.refresh_slots().await?;
+                            excludes.clear();
+                            continue;
+                        } else if kind == ErrorKind::TryAgain || kind == ErrorKind::ClusterDown {
+                            // Sleep and retry.
+                            let sleep_time = 2u64.pow(16 - retries.max(9)) * 10;
+                            thread::sleep(Duration::from_millis(sleep_time));
+                            excludes.clear();
+                            continue;
+                        }
+                    } else if *self.auto_reconnect.borrow() && err.is_io_error() {
+                        let new_connections = Self::create_initial_connections(
+                            &self.initial_nodes,
+                            self.readonly,
+                            self.password.clone(),
+                        ).await?;
+                        {
+                            let mut connections = self.connections.borrow_mut();
+                            *connections = new_connections;
+                        }
+                        self.refresh_slots().await?;
+                        excludes.clear();
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
+
+                    excludes.insert(addr);
+
+                    let connections = self.connections.borrow();
+                    if excludes.len() >= connections.len() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 trait MergeResults {
@@ -685,6 +817,41 @@ impl ConnectionLike for ClusterConnection {
 }
 
 */
+
+impl Conn {
+    async fn _req_packed_command(self, cmd: Cmd) -> RedisResult<Value> {
+        self.inner.lock().await._req_packed_command(&cmd).await
+    }
+
+    async fn _req_packed_commands(self, cmd: super::cmd::Pipeline, offset: usize, count: usize) -> RedisResult<Vec<Value>> {
+        self.inner.lock().await.request_packed_commands(&cmd, offset, count).await
+    }
+}
+
+impl ConnectionLike for Conn {
+    fn req_packed_command(&mut self, cmd: &Cmd) -> RedisFuture<Value> {
+        let fut = tokio::task::spawn_local(self.clone()._req_packed_command(cmd.clone()));
+        async move {
+            fut.await.unwrap()
+        }.boxed()
+    }
+
+    fn req_packed_commands(
+        &mut self,
+        cmd: &super::cmd::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<Vec<Value>> {
+        let fut = tokio::task::spawn_local(self.clone()._req_packed_commands(cmd.clone(), offset, count));
+        async move {
+            fut.await.unwrap()
+        }.boxed()
+    }
+
+    fn get_db(&self) -> i64 {
+        0
+    }
+}
 
 use crate::types::{FromRedisValue, from_redis_value};
 
